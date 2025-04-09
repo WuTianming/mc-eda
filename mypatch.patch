@@ -1,0 +1,119 @@
+diff --git a/pyrtl/passes.py b/pyrtl/passes.py
+index 35f365e..298d01d 100644
+--- a/pyrtl/passes.py
++++ b/pyrtl/passes.py
+@@ -52,6 +52,8 @@ def optimize(update_working_block=True, block=None, skip_sanity_check=False):
+         constant_propagation(block, True)
+         _remove_unlistened_nets(block)
+         common_subexp_elimination(block)
++        if isinstance(block, PostSynthBlock):   # this depends on all wires being removed
++            duplicate_inverter_elimination(block)
+         if (not skip_sanity_check) or _get_debug_mode():
+             block.sanity_check()
+     return block
+@@ -84,7 +86,7 @@ def _remove_wire_nets(block, skip_sanity_check=False):
+     # all of the nets and wires to be removed
+     for net in block.logic:
+         if net.op == 'w':
+-            wire_src_dict[net.dests[0]] = net.args[0]
++            wire_src_dict[net.dests[0]] = net.args[0]   # "dests" and "args" are meant for wirevectors
+             if not isinstance(net.dests[0], Output):
+                 wire_removal_set.add(net.dests[0])
+ 
+@@ -93,6 +95,7 @@ def _remove_wire_nets(block, skip_sanity_check=False):
+     for net in block.logic:
+         if net.op != 'w' or isinstance(net.dests[0], Output):
+             new_args = tuple(wire_src_dict.find_producer(x) for x in net.args)
++            # print(f"args are len(new_args) = {len(new_args)}")      # args = 1 or 2; dests = 1
+             new_net = LogicNet(net.op, net.op_param, new_args, net.dests)
+             new_logic.add(new_net)
+ 
+@@ -300,6 +303,68 @@ def common_subexp_elimination(block=None, abs_thresh=1, percent_thresh=0):
+ ops_where_arg_order_matters = 'm@xc<>-'
+ 
+ 
++def duplicate_inverter_elimination(block=None, abs_thresh=1, percent_thresh=0):
++    block = working_block(block)
++    net_count = _NetCount(block)
++
++    num_removed = 0
++    while net_count.shrinking(block, percent_thresh, abs_thresh):
++        # each wire appears only once as some net's "dests"; however, it can appear many times as some net's "arg".
++        dst_to_net = dict()
++        for net in block.logic:
++            dst_to_net[net.dests[0]] = net
++
++        # replace the receiving net to take the correct input (from someone's output)
++        inverters_to_delete = None
++        wires_to_delete = None
++        for net in block.logic:
++            # look for gates that: input from a '~' (map[~.dests] -> ~.args) who input from a '~'
++            found = False
++            for arg in net.args:
++                if arg not in dst_to_net:
++                    break   # probably reads from Input
++                prev_net = dst_to_net[arg]
++                if prev_net.op == '~' and prev_net.args[0] in dst_to_net:
++                    prev_prev_net = dst_to_net[prev_net.args[0]]
++                    if prev_prev_net.op == '~':
++                        # we gotta make sure "prev_prev_net" isn't required by some other net
++                        fail = False
++                        for net2 in block.logic:
++                            if net2 is not prev_net and prev_prev_net.dests[0] in set(net2.args):
++                                fail = True
++                                break
++                        if not fail:
++                            inverters_to_delete = [prev_net, prev_prev_net]
++                            wires_to_delete = [prev_net.dests[0], prev_prev_net.dests[0]]
++                            source_wire = prev_prev_net.args[0]
++                            found = True
++                            break
++            if found:
++                break
++        if inverters_to_delete is not None:
++            nets_to_delete = []
++            nets_to_add = []
++            for net in block.logic:
++                if prev_net.dests[0] in set(net.args):
++                    nets_to_delete.append(net)
++                    new_args = tuple((source_wire if x is prev_net.dests[0] else x) for x in net.args)
++                    nets_to_add.append(LogicNet(net.op, net.op_param, new_args, net.dests))
++            block.logic.remove(inverters_to_delete[0])
++            block.logic.remove(inverters_to_delete[1])
++            block.remove_wirevector(wires_to_delete[0])
++            block.remove_wirevector(wires_to_delete[1])
++            for net in nets_to_delete:
++                block.logic.remove(net)
++            for net in nets_to_add:
++                block.logic.add(net)
++            num_removed += 1
++    print("{} pairs of NOT gates removed.".format(num_removed))
++
++
++def multi_input_nand_synth():
++    raise NotImplementedError()
++
++
+ def _find_common_subexps(block):
+     """ Finds nets that can be considered the same based on op type, op param, and arguments.
+ 
+@@ -391,7 +456,7 @@ def _process_nets_to_discard(nets, wire_map, unnecessary_nets):
+         dest_w = net_to_keep.dests[0]
+         for net in nets_to_discard:
+             old_dst = net.dests[0]
+-            wire_map[old_dst] = dest_w
++            wire_map[old_dst] = dest_w  # map[net.dests[0]] = net0.dests[0]
+             unnecessary_nets.append(net)
+ 
+ 
+@@ -673,7 +738,9 @@ def nand_synth(net):
+         dest <<= (~arg(0)).nand(~arg(1))
+     elif net.op == '^':
+         temp_0 = arg(0).nand(arg(1))
+-        dest <<= temp_0.nand(arg(0)).nand(temp_0.nand(arg(1)))
++        temp_L = temp_0.nand(arg(0))
++        temp_R = temp_0.nand(arg(1))
++        dest <<= temp_L.nand(temp_R)
+     else:
+         raise PyrtlError("Op, '{}' is not supported in nand_synth".format(net.op))
+ 
