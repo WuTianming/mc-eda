@@ -4,6 +4,8 @@ from amulet.api.chunk import Chunk
 ST = StringTag
 from amulet.api.errors import ChunkLoadError, ChunkDoesNotExist
 
+from data_structures import LaneOp, Lane, Layer, FloorPlan
+
 # prefix_path = "/Users/wtm/playground/minecraft/.minecraft/saves/PythonGenerated-2"
 prefix_path = "/Users/wtm/playground/minecraft/.minecraft/versions/1.18.2-Fabric/saves/PythonGenerated-2"
 level = amulet.load_level(prefix_path)
@@ -239,7 +241,7 @@ def put_nor_layer_0(x, y, z, wires, input_len, output_len, inv, tmap, initial=Fa
                     else:
                         putblk(1, 1, i, repeater["e"])
 
-def put_nor_array(x, y, z, floor_plan=None):
+def put_nor_array(x, y, z, floor_plan: FloorPlan):
     wire_counts = [0,] + [len(f) for f in floor_plan] + [6, ]
     depth = len(wire_counts) - 2
     with Offset(x, y, z):
@@ -249,7 +251,8 @@ def put_nor_array(x, y, z, floor_plan=None):
             inverter_map = floor_plan[d]
             inverter_mask = []
             for t in range(len(inverter_map)):
-                if inverter_map[t][0] in ('hold', 'Resetter'):
+                if inverter_map.lanes[t].lane_op == LaneOp.HOLD or (
+                   inverter_map[t].is_input and inverter_map[t].input_name == 'Resetter'):
                     inverter_mask.append(True)
                 else:
                     inverter_mask.append(False)
@@ -260,17 +263,14 @@ def put_nor_array(x, y, z, floor_plan=None):
             if d < depth - 1:
                 torches_map = floor_plan[d+1]
                 for t in range(len(torches_map)):
-                    if torches_map[t][0] == 'hold':
-                        for var in torches_map[t][1:]:
-                            if isinstance(var, int):
-                                tmap[var].add(t)
-                        # tmap[torches_map[t][1]].add(t)
-                    elif isinstance(torches_map[t][0], str):
+                    if torches_map[t].lane_op == LaneOp.HOLD:
+                        for arg in torches_map[t].lane_operands:
+                            tmap[arg].add(t)
+                    elif torches_map[t].lane_op == LaneOp.INPUT:
                         print("should be input, but input shouldn't be in the next layer anytime")
                     else:
-                        for var in torches_map[t]:
-                            if isinstance(var, int):
-                                tmap[var].add(t)
+                        for arg in torches_map[t].lane_operands:
+                            tmap[arg].add(t)
 
             # print(inverter_mask)
             # print(tmap)
@@ -313,46 +313,52 @@ def work():
             clrchunk(cx, cz)
 
     import pickle
-    with open("max.pkl", "rb") as f:
-        floor_plan = pickle.load(f)
-    # floor_plan = [
-    #     {0: ['inputA', 0], 1: ['inputB', 0]},
-    #     {0: ['hold', 0],   1: ['hold', 1]},
-    #     {0: [0, 1], 1: [0]},
-    # ]
-    def gen_dummy_floor_plan(width, height):
-        plan = []
-        floor = {}
+    with open("circuit.pkl", "rb") as f:
+        floor_plan: FloorPlan = pickle.load(f)
+
+    def gen_dummy_floor_plan(width: int, height: int) -> FloorPlan:
+        floor_plan = FloorPlan()
+        input_layer = Layer()
+        input_layer.layer_id = 0
         for i in range(width):
-            floor[i] = [f'input_{i}', 0]
-        plan.append(floor)
-        for i in range(height-1):
-            floor = {}
+            lane = Lane(lane_id=i, lane_op=LaneOp.INPUT, lane_operands=[f'input_{i}', 0])
+            input_layer[i] = lane
+        floor_plan.layers.append(input_layer)
+        for layer_idx in range(1, height):
+            hold_layer = Layer()
+            hold_layer.layer_id = layer_idx
             for i in range(width):
-                floor[i] = ['hold', i]
-            plan.append(floor)
-        return plan
-    def augment_floor_plan(floor_plan):
-        def inc_by_1(wire):
-            return [(u+1 if isinstance(u, int) else u) for u in wire]
-        # for each layer, add a wire that is listened by all wires next layer
-        # Note: this wire must be on the outer rim -- smallest wire numbering
-        floor_plan[0] = dict([(u+1,v) for (u,v) in floor_plan[0].items()])
-        floor_plan[0][0] = ['Resetter', 0]
-        for f in range(1, len(floor_plan)-1):
-            floor_plan[f] = dict([(u+1,inc_by_1(v)) for (u,v) in floor_plan[f].items()])
-            w = len(floor_plan[f])
-            for wire in range(1,w+1):
-                floor_plan[f][wire].append(0)
-            floor_plan[f][0] = ['hold', 0]
-        floor_plan[-1] = dict([(u,inc_by_1(v)) for (u,v) in floor_plan[-1].items()])
-        w = len(floor_plan[-1])
-        for wire in range(w):
-            floor_plan[-1][wire].append(0)
-    # floor_plan = gen_dummy_floor_plan(20, 8)
+                lane = Lane(lane_id=i, lane_op=LaneOp.HOLD, lane_operands=[i])
+                hold_layer[i] = lane
+            floor_plan.layers.append(hold_layer)
+        return floor_plan
+
+    def augment_floor_plan(floor_plan: FloorPlan):
+        def inc_listen_by_1(lane: Lane):
+            if lane.lane_op == LaneOp.INPUT:
+                return lane
+            else:
+                lane.lane_operands = [u+1 for u in lane.lane_operands]
+                return lane
+        def inc_lane_by_1(layer: Layer):
+            tmp = [(u+1, v) for (u,v) in layer.lanes.items()]
+            for u,v in tmp:
+                v.lane_id += 1
+            layer.lanes = dict(tmp)
+        inc_lane_by_1(floor_plan.layers[0])
+        floor_plan.layers[0][0] = Lane(0, LaneOp.INPUT, ["Resetter", 0])
+        for f in range(1, len(floor_plan)):
+            for u,v in floor_plan[f].items():
+                floor_plan[f][u] = inc_listen_by_1(v)
+            if f == len(floor_plan) - 1:
+                break
+            inc_lane_by_1(floor_plan[f])
+            floor_plan.layers[f][0] = Lane(0, LaneOp.HOLD, [0])
+
     augment_floor_plan(floor_plan)
-    for f in floor_plan:
+    for f in floor_plan.layers:
         print(f)
+    floor_plan.print_stats()
 
     def platform(y=0):
         putblk(0, y, 0, gold); putblk(0, y, -1); putblk(-1, y, 0); putblk(-1, y, -1)

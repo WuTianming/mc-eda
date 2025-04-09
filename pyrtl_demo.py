@@ -1,7 +1,8 @@
 from typing import Tuple
 import pyrtl
 from pyrtl import Register, Const, Input, Output, WireVector, LogicNet, concat_list, concat
-import networkx as nx
+
+from data_structures import LaneOp, Lane, Layer, FloorPlan
 
 def one_bit_add(a, b, carry_in):
     assert len(a) == len(b) == 1  # len returns the bitwidth
@@ -28,7 +29,7 @@ def demo_adder(BIT=3):
     sum, carry_out = ripple_add(input_A, input_B)
 
     # final_out <<= input_A + input_B
-    final_out <<= concat(sum, carry_out)
+    final_out <<= concat(carry_out, sum)    # msb / lsb
 
 def demo_adder_resetter(BIT=3):
     # instantiate an adder into a 3-bit counter
@@ -108,9 +109,9 @@ def demo_ALU(n_bits=4):
     ALU_Out <<= alu_result
 
 
-demo_adder(BIT=8)
+# demo_adder(BIT=8)
 
-# demo_adder()
+demo_adder(BIT=2)
 # demo_max(BIT=1)
 # demo_ALU(n_bits=8)
 
@@ -120,15 +121,18 @@ demo_adder(BIT=8)
 # final_out <<= input_A.nand(input_B)
 
 # synthesize into NAND gates
+with open("circ1.dot", "w") as f:
+    f.write(pyrtl.block_to_graphviz_string())
 pyrtl.optimize()  # pre-synth optimize doesn't do much, but helped in the demo_adder(BIT=1)
 pyrtl.synthesize()
 pyrtl.optimize()
+with open("circ2.dot", "w") as f:
+    f.write(pyrtl.block_to_graphviz_string())
 pyrtl.nand_synth()
 pyrtl.optimize()
 # pyrtl.common_subexp_elimination(pyrtl.working_block())
 # pyrtl.constant_propagation(pyrtl.working_block())
-
-with open("adder.dot", "w") as f:
+with open("circ3.dot", "w") as f:
     f.write(pyrtl.block_to_graphviz_string())
 
 def namer(thing, is_edge=True):
@@ -503,7 +507,7 @@ def get_nand_circuit_1(block=None):
     # return netlist, gates, outputs, idmap
     return gates, outputs, idmap
 
-def floor_planning(block=None, max_width=32):
+def floor_planning(block=None, max_width=32) -> FloorPlan:
     # 2. merge Chain NANDs into multi-input NAND
     # 3. reverse all input/output/consts to generate the dual graph
     # 4. inter-layer planning
@@ -645,22 +649,31 @@ def floor_planning(block=None, max_width=32):
             lanes[g] = inc
             inc += 1
         floor_lanes.append(lanes)
-    floor_plan_in_num = []
+
+    floor_plan_final = FloorPlan()
+
     for idx,floor in enumerate(floor_plan):
-        floor_in_num = dict()
+        floor_in_num = Layer()
+        floor_in_num.layer_id = idx
+
         for g in floor:
             g_num = floor_lanes[idx][g]
-            # print(type(floor[g]))
             if floor[g] == 'input':
-                floor_in_num[g_num] = [str(g[0]), g[1]]
+                input_name = str(g[0])
+                input_which_bit = g[1]
+                floor_in_num.lanes[g_num] = Lane(g_num, LaneOp.INPUT, [input_name, input_which_bit])
             elif floor[g] == 'const':
-                floor_in_num[g_num] = ["const", g.val]
+                # floor_in_num[g_num] = ["const", g.val]
+                raise ValueError()
             elif floor[g] == 'hold':
-                floor_in_num[g_num] = ["hold", floor_lanes[idx-1][g], ]
+                # floor_in_num[g_num] = ["hold", floor_lanes[idx-1][g], ]
+                floor_in_num.lanes[g_num] = Lane(g_num, LaneOp.HOLD, [floor_lanes[idx-1][g]])
             else:
-                floor_in_num[g_num] = []
+                NAND_operands = []
                 for gg in floor[g]:
-                    floor_in_num[g_num].append(floor_lanes[idx-1][gg])
+                    # floor_in_num[g_num].append(floor_lanes[idx-1][gg])
+                    NAND_operands.append(floor_lanes[idx-1][gg])
+                floor_in_num.lanes[g_num] = Lane(g_num, LaneOp.NAND, NAND_operands)
             for o in outputs:
                 def indexof(net, netlist):
                     for idx, n2 in enumerate(netlist):
@@ -668,50 +681,26 @@ def floor_planning(block=None, max_width=32):
                             return idx
                     return -1
                 if g in set(outputs[o]):
-                    floor_in_num[g_num].append("Output: " + str(o) + f" [{indexof(g, outputs[o])}]")
+                    # floor_in_num[g_num].append("Output: " + str(o) + f" [{indexof(g, outputs[o])}]")
+                    floor_in_num.lanes[g_num].is_output = True
+                    floor_in_num.lanes[g_num].output_name = str(o)
+                    floor_in_num.lanes[g_num].output_which_bit = indexof(g, outputs[o])
                     break
-        floor_plan_in_num.append(floor_in_num)
+        floor_plan_final.layers.append(floor_in_num)
 
-    return floor_lanes, floor_plan_in_num
-
-def floor_plan_stats(floor_plan):
-    n_layers = len(floor_plan)
-    n_in, n_out = len(floor_plan[0]), len(floor_plan[-1])
-    tot_gates = sum([len(f) for f in floor_plan])
-    # max/min/avg circuit width
-    max_w, min_w, avg_w = max([len(f) for f in floor_plan]), min([len(f) for f in floor_plan]), tot_gates/n_layers
-    # total and average of "hold" gates
-    tot_hold, avg_hold = 0,0
-    for floor in floor_plan:
-        tot_hold += len([g for g in floor if floor[g][0] == 'hold'])
-    avg_hold = tot_hold / n_layers
-
-    print()
-    print(" ======== FLOOR PLAN STATISTICS ========")
-    print(f"   Number of layers       : {n_layers}")
-    print(f"   Input width            : {n_in}")
-    print(f"   Output width           : {n_out}")
-    print(f"   Total gates            : {tot_gates}")
-    print(f"   Max circuit width      : {max_w}")
-    print(f"   Min circuit width      : {min_w}")
-    print(f"   Avg circuit width      : {avg_w:.2f}")
-    print(f"   Total 'hold' gates     : {tot_hold}")
-    print(f"   Avg 'hold' gates/layer : {avg_hold:.2f}")
-    print(f"   hold / total gates     : {tot_hold / tot_gates:.2f}")
-    print(" ======================================")
-    print()
+    return floor_plan_final
 
 def nand_block_to_torch_tensor(block=None, max_width=16):
     # (done) when a NOT gate is only feeding other NOT gates, the subtree can be removed. make this a synthesizing pass
-    floor_lanes, floor_plan_in_num = floor_planning(block, max_width=max_width)
+    floor_plan_final = floor_planning(block, max_width=max_width)
     print("\n\n == FLOOR PLAN ==")
-    for floor in floor_plan_in_num:
+    for floor in floor_plan_final.layers:
         print(floor)
-    floor_plan_stats(floor_plan_in_num)
+    floor_plan_final.print_stats()
 
     import pickle
-    with open("max.pkl", "wb") as f:
-        pickle.dump(floor_plan_in_num, f)
+    with open("circuit.pkl", "wb") as f:
+        pickle.dump(floor_plan_final, f)
 
 # nand_block_to_torch_tensor(max_width=32)
 nand_block_to_torch_tensor(max_width=150)

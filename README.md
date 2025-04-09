@@ -2,6 +2,8 @@
 
 See screenshots/.
 
+![screenshot](screenshots/screenshot.png)
+
 
 
 ## Changelog
